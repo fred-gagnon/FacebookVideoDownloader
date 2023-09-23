@@ -143,53 +143,151 @@ do {
   }
   [Microsoft.PowerShell.Commands.BasicHtmlWebResponseObject]$Response = Invoke-WebRequest @Parameters
 
-  if ($response.Content -notmatch '"dash_manifest":".*?[^\\]"') {
-    throw "Failed to isolate the dash manifest"
+  [PSCustomObject[]]$blobAttachments = @()
+  [PSCustomObject]$video = $null
+
+  if ($Response.Content -match '<script[^>]+?>(?<Json>.*?blob_attachments.*?)</script>') {
+    [string]$JsonScript = $Matches['Json']
+    if ($JsonScript -notmatch '"blob_attachments":\[(((?<Open>{)[^{}]*)+((?<Close-Open>})[^{}]*)+)*(?(Open)(?!))\]') {
+      throw "Failed to isolate the blob attachments data"
+    }
+
+    $blobAttachments = @("{$($Matches['Close'])}" | ConvertFrom-Json)
   }
 
-  [xml]$DashManifestXml = [xml]("{$($Matches[0])}" | ConvertFrom-Json | Select-Object -ExpandProperty dash_manifest)
+  if ($Response.Content -match '<script[^>]+?>(?<Json>.*?dash_manifest.*?)</script>') {
+    [string]$JsonScript = $Matches['Json']
 
-  [System.Collections.Generic.List[PSCustomObject]]$Representations = [System.Collections.Generic.List[PSCustomObject]]::new()
-  foreach ($RepresentationNode in $DashManifestXml.MPD.Period.AdaptationSet.Representation) {
-    #if ($RepresentationNode.mimeType -notlike '*video*') {
-    #  continue
-    #}
-
-    [PSCustomObject]$Representation = $null
-    [PSCustomObject]$AudioRepresentation = $null
-    if ($RepresentationNode.mimeType -like '*video*') {
-      $Representation = [PSCustomObject]@{
-        Type     = $RepresentationNode.mimeType
-        Quality  = "$($RepresentationNode.FBQualityClass.ToUpperInvariant()) - $($RepresentationNode.FBQualityLabel)"
-        Width    = $RepresentationNode.width
-        Height   = $RepresentationNode.height
-        Rate     = $RepresentationNode.frameRate
-        Codecs   = $RepresentationNode.codecs
-        Url      = $RepresentationNode.BaseURL
-        Filename = Split-Path -Path ($RepresentationNode.BaseURL -replace '\?.*', $null) -Leaf
-      }
+    if ($JsonScript -notmatch '"video":(((?<Open>{)[^{}]*)+((?<Close-Open>})[^{}]*)+)*(?(Open)(?!))') {
+      hrow "Failed to isolate the video data"
     }
-    elseif ($RepresentationNode.mimeType -like '*audio*') {
-      if ($null -eq $AudioRepresentation) {
-        $AudioRepresentation = [PSCustomObject]@{
-          Type     = $RepresentationNode.mimeType
-          Quality  = $RepresentationNode.FBEncodingTag
-          Width    = $null
-          Height   = $null
-          Rate     = $RepresentationNode.audioSamplingRate
-          Codecs   = $RepresentationNode.codecs
-          Url      = $RepresentationNode.BaseURL
-          Filename = Split-Path -Path ($RepresentationNode.BaseURL -replace '\?.*', $null) -Leaf
+
+    $video = "{$($Matches['Close'])}" | ConvertFrom-Json
+  }
+
+  [PSCustomObject]$Representation = $null
+  [PSCustomObject]$AudioRepresentation = $null
+  [System.Collections.Generic.List[PSCustomObject]]$Representations = [System.Collections.Generic.List[PSCustomObject]]::new()
+  if ($null -ne $video) {
+    if ($null -ne $video.dash_manifest) {
+      [xml]$DashManifestXml = [xml]($video.dash_manifest)
+
+      foreach ($RepresentationNode in $DashManifestXml.MPD.Period.AdaptationSet.Representation) {
+        [string]$baseUrl = $RepresentationNode.Attributes['BaseURL'] | Select-Object -ExpandProperty Value
+        [string]$mimeType = $RepresentationNode.Attributes['mimeType'] | Select-Object -ExpandProperty Value
+        [string]$codecs = $RepresentationNode.Attributes['codecs'] | Select-Object -ExpandProperty Value
+
+        if ($mimeType -like '*video*') {
+          if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+            if (-not [string]::IsNullOrWhiteSpace($video.browser_native_hd_url)) {
+              $baseUrl = $video.browser_native_hd_url
+            }
+            else {
+              $baseUrl = $video.browser_native_sd_url
+            }
+
+            if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+              throw "Unable to get URL"
+            }
+          }
+
+          [string]$frameRate = $RepresentationNode.Attributes['frameRate'] | Select-Object -ExpandProperty Value
+          [string]$fbQualityClass = $RepresentationNode.Attributes['FBQualityClass'] | Select-Object -ExpandProperty Value
+          [string]$fBQualityLabel = $RepresentationNode.Attributes['FBQualityLabel'] | Select-Object -ExpandProperty Value
+          [string]$width = $RepresentationNode.Attributes['width'] | Select-Object -ExpandProperty Value
+          [string]$height = $RepresentationNode.Attributes['height'] | Select-Object -ExpandProperty Value
+
+          $Representation = [PSCustomObject]@{
+            Type     = $mimeType
+            Quality  = "$($fbQualityClass.ToUpperInvariant()) - $($fBQualityLabel)"
+            Width    = $width
+            Height   = $height
+            Rate     = $frameRate
+            Codecs   = $codecs
+            Url      = $baseUrl
+            Filename = ($baseUrl -replace '\?.*', $null) | Split-Path -Leaf
+          }
+        }
+        elseif ($mimeType -like '*audio*') {
+          if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+            continue
+          }
+
+          [string]$fbEncodingTag = $RepresentationNode.Attributes['FBEncodingTag'] | Select-Object -ExpandProperty Value
+          [string]$audioSamplingRate = $RepresentationNode.Attributes['audioSamplingRate'] | Select-Object -ExpandProperty Value
+
+          if ($null -eq $AudioRepresentation) {
+            $AudioRepresentation = [PSCustomObject]@{
+              Type     = $mimeType
+              Quality  = $fbEncodingTag
+              Width    = $null
+              Height   = $null
+              Rate     = $audioSamplingRate
+              Codecs   = $codecs
+              Url      = $baseUrl
+              Filename = ($baseUrl -replace '\?.*', $null) | Split-Path -Leaf
+            }
+          }
+          else {
+            Write-Warning "Found more than one audio representation"
+          }
+        }
+
+        if ($null -ne $Representation) {
+          $Representations.Add($Representation)
         }
       }
-      else {
-        Write-Warning "Found more than one audio representation"
+    }
+    else {
+      if ($null -ne $video.browser_native_sd_url) {
+        $Representation = [PSCustomObject]@{
+          Type     = 'video'
+          Quality  = 'SD'
+          Width    = $null
+          Height   = $null
+          Rate     = $null
+          Codecs   = $null
+          Url      = $video.browser_native_sd_url
+          Filename = Split-Path -Path ($video.browser_native_sd_url -replace '\?.*', $null) -Leaf
+        }
+        $Representations.Add($Representation)
+      }
+      if ($null -ne $video.browser_native_hd_url) {
+        $Representation = [PSCustomObject]@{
+          Type     = 'video'
+          Quality  = 'SD'
+          Width    = $null
+          Height   = $null
+          Rate     = $null
+          Codecs   = $null
+          Url      = $video.browser_native_hd_url
+          Filename = Split-Path -Path ($video.browser_native_hd_url -replace '\?.*', $null) -Leaf
+        }
+        $Representations.Add($Representation)
       }
     }
+  }
 
-    if ($null -ne $Representation) {
-      $Representations.Add($Representation)
+  foreach ($blobAttachment in $blobAttachments) {
+    if ($blobAttachments.__typename -ne 'MessageVideo') {
+      continue
     }
+    [string]$url = if (-not [string]::IsNullOrWhiteSpace($blobAttachment.hdUrl)) { $blobAttachment.hdUrl } else { $blobAttachment.sdUrl }
+    $Representation = [PSCustomObject]@{
+      Type     = 'video'
+      Quality  = if ($blobAttachment.sdUrl -eq $blobAttachment.hdUrl) { 'SD' } else { 'HD' }
+      Width    = $blobAttachment.original_dimensions.x
+      Height   = $blobAttachment.original_dimensions.y
+      Rate     = $null
+      Codecs   = $null
+      Url      = $url
+      Filename = ($url -replace '\?.*', $null) | Split-Path -Leaf
+    }
+    $Representations.Add($Representation)
+  }
+
+  if ($Representations.Count -eq 0) {
+    throw "Found nothing to download"
   }
 
   [PSCustomObject[]]$Selections = @($Representations | Out-GridView -Title "Please select what you want to download" -OutputMode Multiple)
@@ -218,7 +316,9 @@ do {
     }
 
     if ($null -eq $AudioRepresentation) {
-      Write-Warning "Found no audio track for the requested video file"
+      if ($Representations.Count -gt 1) {
+        Write-Warning "Found no audio track for the requested video file"
+      }
 
       [hashtable]$Parameters = @{
         OutFile     = $FileBrowser.FileName
@@ -229,6 +329,7 @@ do {
         ContentType = $ContentType
       }
 
+      Write-Host "Downloading '$($FileBrowser.FileName | Split-Path -Leaf)', please wait"
       Invoke-WebRequest @Parameters
     }
     else {
@@ -242,6 +343,7 @@ do {
         ContentType = $ContentType
       }
 
+      Write-Host "Downloading video data '$($VideoPath | Split-Path -Leaf)', please wait"
       Invoke-WebRequest @Parameters
 
       [string]$AudioPath = Join-Path -Path $env:TEMP -ChildPath $AudioRepresentation.Filename
@@ -254,14 +356,16 @@ do {
         ContentType = $ContentType
       }
 
+      Write-Host "Downloading audio data from '$($AudioPath | Split-Path -Leaf)', please wait"
       Invoke-WebRequest @Parameters
 
+      Write-Host "Merging audio and video data, please wait"
       Merge-AudioVideo -VideoPath $VideoPath -AudioPath $AudioPath -OutputPath $FileBrowser.FileName
 
       if (Test-Path -Path $VideoPath -PathType Leaf) {
         Remove-Item -Path $VideoPath -Force -ErrorAction Stop
       }
-      
+
       if (Test-Path -Path $AudioPath -PathType Leaf) {
         Remove-Item -Path $AudioPath -Force -ErrorAction Stop
       }

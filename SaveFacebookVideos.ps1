@@ -1,6 +1,8 @@
 
 Set-StrictMode -Version 2.0
 
+trap { Write-Error -ErrorRecord $_; Pause; exit -1; }
+
 Add-Type -AssemblyName 'System.Windows.Forms'
 
 function Merge-AudioVideo {
@@ -155,14 +157,16 @@ do {
     $blobAttachments = @("{$($Matches['Close'])}" | ConvertFrom-Json)
   }
 
-  if ($Response.Content -match '<script[^>]+?>(?<Json>.*?dash_manifest.*?)</script>') {
+  if ($Response.Content -match '<script[^>]+?>(?<Json>.*?"dash_manifest".*?)</script>') {
     [string]$JsonScript = $Matches['Json']
 
-    if ($JsonScript -notmatch '"video":(((?<Open>{)[^{}]*)+((?<Close-Open>})[^{}]*)+)*(?(Open)(?!))') {
-      hrow "Failed to isolate the video data"
+    [string]$braceMatchingRegex = '(?>{(?<LEVEL>)|}(?<-LEVEL>)|(?!{|}).)+(?(LEVEL)(?!))'
+    [string]$regex = "(?i){${braceMatchingRegex}dash_manifest${braceMatchingRegex}}"
+    if ($JsonScript -notmatch $regex) {
+      throw "Failed to isolate the video data"
     }
 
-    $video = "{$($Matches['Close'])}" | ConvertFrom-Json
+    $video = $Matches[0] | ConvertFrom-Json
   }
 
   [PSCustomObject]$Representation = $null

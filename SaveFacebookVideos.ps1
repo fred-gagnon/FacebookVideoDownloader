@@ -1,7 +1,12 @@
 
 Set-StrictMode -Version 2.0
 
-trap { Write-Error -ErrorRecord $_; Pause; exit -1; }
+trap {
+  Write-Host "Stack Trace:" -ForegroundColor Red
+  Write-Host $_.ScriptStackTrace -ForegroundColor Red
+  Write-Error -ErrorRecord $_
+  Pause; exit -1;
+}
 
 Add-Type -AssemblyName 'System.Windows.Forms'
 
@@ -294,7 +299,7 @@ do {
     throw "Found nothing to download"
   }
 
-  [PSCustomObject[]]$Selections = @($Representations | Out-GridView -Title "Please select what you want to download" -OutputMode Multiple)
+  [PSCustomObject[]]$Selections = @($Representations | Sort-Object -Property Width, Height -Descending | Out-GridView -Title "Please select what you want to download" -OutputMode Multiple)
 
   foreach ($Selection in $Selections) {
     [string]$FileName = Split-Path -Path $Selection.Filename -Leaf
@@ -334,7 +339,24 @@ do {
       }
 
       Write-Host "Downloading '$($FileBrowser.FileName | Split-Path -Leaf)', please wait"
-      Invoke-WebRequest @Parameters
+      [int]$attempt = 0
+      [bool]$download = $true
+      while ($download) {
+        try {
+          Invoke-WebRequest @Parameters
+          $download = $false
+        }
+        catch {
+          if ($attempt -le 10) {
+            Write-Warning "Failed to download '$($FileBrowser.FileName | Split-Path -Leaf)', will retry in 1 second (attempt $attempt/10), error message is: '$($_.Exception.Message)'"
+            Start-Sleep -Seconds 1
+            $attempt++
+          }
+          else {
+            throw $_
+          }
+        }
+      }
     }
     else {
       [string]$VideoPath = Join-Path -Path $env:TEMP -ChildPath $Selection.Filename
